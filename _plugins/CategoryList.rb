@@ -3,18 +3,28 @@ require "cgi"
 module Jekyll
   # Automatic member lists for category pages.
   #
-  # A site-root category page (<category>.md, for example author.md or guides.md)
-  # gets a list appended to its content at render time. A category page lists:
-  #   - every page under <category>/ (author content mirrored by Authors.rb plus
-  #     pages committed directly in that directory), following the chapter
-  #     `order` when present and sorted by path otherwise;
-  #   - every post whose `categories` include <category>, newest first.
-  # Each item shows the page title (or the filename when there is no title) and
-  # links to the page.
+  # A category page is the page that hosts a category: the path without its
+  # extension is the category id. So guides.md hosts "guides" and
+  # guides/advanced.md hosts "guides/advanced". A category page provided by an
+  # author (see _plugins/Authors.rb, `category_page: true`) counts too, even
+  # though the mirror writes it.
+  #
+  # A listing-only category (see PluginUtils::LISTING_CATEGORIES) works the same
+  # way without touching this module: _posts.md at the site root hosts "_posts",
+  # so every post declaring `categories: [_posts]` is listed on /_posts.html.
+  # Jekyll drops files starting with "_", which is why allow_listing_pages adds
+  # those page names to site.include before the site is read.
+  #
+  # A category page lists:
+  #   - its direct sub categories, linked to their category pages;
+  #   - the pages that live directly in <category>/ and every post whose
+  #     categories include <category>, newest first.
+  # Sub category content is not repeated in the parent list; deeper pages show
+  # up on the category page that owns them.
   #
   # Opt out for a single page with `category_list: false` in its front matter, or
-  # place {% category_list %} / {% category_list guides %} manually to control
-  # where the list appears (the automatic append is then skipped).
+  # place {% category_list %} / {% category_list guides/advanced %} manually to
+  # control where the list appears (the automatic append is then skipped).
   module CategoryList
     class << self
       # :pages, :pre_render hook: append the list tag to category pages.
@@ -23,15 +33,10 @@ module Jekyll
         return if page.data["category_list"] == false
         return if page.content.to_s.include?("category_list")
 
-        rel = relative_path(page)
-        return if rel.include?("/") # only site-root category pages
-
-        category = File.basename(rel, File.extname(rel))
-        return if category.empty?
-
         site = page.respond_to?(:site) ? page.site : nil
         return if site.nil?
-        return if members(site, category, page).empty?
+        return unless category_page?(page, site)
+        return if entries(page, site).empty?
 
         page.content = "#{page.content}\n\n{% category_list %}\n"
       end
@@ -42,57 +47,223 @@ module Jekyll
         category = category_for(page, site, explicit)
         return "" if category.nil?
 
-        docs = members(site, category, page)
-        return "" if docs.empty?
+        items = entries(page, site, category)
+        return "" if items.empty?
 
-        items = docs.map do |doc|
-          url = doc_url(site, doc)
-          %(<li><a href="#{CGI.escapeHTML(url)}">#{CGI.escapeHTML(display_name(doc))}</a></li>)
-        end
         %(<ul class="category-list">#{items.join}</ul>)
+      end
+
+      # Jekyll skips every entry whose name starts with "_", so a listing page
+      # such as _posts.md has to be added to site.include explicitly. Only the
+      # page file names are included, never the bare directory, so the post
+      # sources stay in the collection where they belong.
+      def allow_listing_pages(site)
+        return if site.nil?
+
+        files = Jekyll::PluginUtils::LISTING_CATEGORIES.flat_map do |id|
+          %W[#{id}.md #{id}.markdown]
+        end
+        site.include = (Array(site.include) + files).uniq
+      end
+
+      # Drop the memoised index. Jekyll reuses the Site object for `jekyll serve`
+      # rebuilds but recreates every page object, so a cached index would keep
+      # pointing at the previous build's pages and every identity check would
+      # fail on the second build.
+      def reset_index
+        @index = nil
+      end
+
+      # Categories in use for the current build, memoised per site.
+      # { :ids => [category id, ...], :pages => { category id => page } }
+      def index(site)
+        cached = @index
+        return cached[:data] if cached && cached[:site].equal?(site)
+
+        @index = { :site => site, :data => build_index(site) }
+        @index[:data]
+      end
+
+      # True when this page hosts a category.
+      def category_page?(page, site)
+        !hosted_category(page, site).nil?
+      end
+
+      # Category id this page hosts, or nil when the page is not a category page.
+      def hosted_category(page, site)
+        return nil if page.nil? || site.nil?
+
+        key = category_key(page)
+        host = index(site)[:pages][key]
+        return nil if host.nil?
+
+        # The Liquid tag hands us the page drop instead of the page object, so
+        # compare paths rather than object identity.
+        relative_path(host) == relative_path(page) ? key : nil
+      end
+
+      # Page that hosts the given category, or nil.
+      def category_page_for(site, category)
+        id = Jekyll::PluginUtils.category_normalize(category)
+        return nil if id.nil?
+
+        index(site)[:pages][id]
+      end
+
+      # Category page a document belongs under: the first declared category that
+      # has a category page, in declaration order. Used for the "back up" link.
+      def parent_category_page(site, doc)
+        return nil if site.nil? || doc.nil?
+
+        data = doc.respond_to?(:data) ? doc.data : doc
+        raw = data["categories"]
+        raw = data["category"] if raw.nil?
+        pages = index(site)[:pages]
+
+        Jekyll::PluginUtils.normalize_list(raw).each do |value|
+          id = Jekyll::PluginUtils.category_normalize(value)
+          next if id.nil?
+
+          page = pages[id]
+          return page unless page.nil?
+        end
+        nil
+      end
+
+      # Direct sub categories of a category as [id, page] pairs, in chapter
+      # `order` when the category page declares one, by path otherwise.
+      def child_categories(site, category)
+        id = Jekyll::PluginUtils.category_normalize(category)
+        return [] if site.nil? || id.nil?
+
+        data = index(site)
+        children = data[:ids].select do |child|
+          Jekyll::PluginUtils.category_parent(child) == id
+        end
+        pairs = children.filter_map do |child|
+          page = data[:pages][child]
+          [child, page] unless page.nil?
+        end
+        pairs.sort_by { |_child, page| page_sort_key(page) }
       end
 
       private
 
-      # Category of the current page: explicit argument -> front matter
-      # categories/category -> inferred from the path.
+      def build_index(site)
+        ids = {}
+        (site.pages + site.posts.docs).each do |doc|
+          Jekyll::PluginUtils.normalize_list(doc.data["categories"]).each do |raw|
+            id = Jekyll::PluginUtils.category_normalize(raw)
+            next if id.nil? || !Jekyll::PluginUtils.category_listable?(id)
+
+            ids[id] = true
+            # An ancestor only needs a page to be listable as a sub category.
+            Jekyll::PluginUtils.category_ancestors(id).each { |ancestor| ids[ancestor] = true }
+          end
+        end
+
+        # A category page provided by an author introduces its category even
+        # when nothing declares it yet.
+        provided = Jekyll::Authors.provided_category_pages
+        provided.each_value do |id|
+          ids[id] = true
+          Jekyll::PluginUtils.category_ancestors(id).each { |ancestor| ids[ancestor] = true }
+        end
+
+        pages = {}
+        site.pages.each do |page|
+          key = category_key(page)
+          next unless ids.key?(key)
+          # A mirrored file is only a category page when Authors says so.
+          next if mirrored?(page) && !provided.key?(relative_path(page))
+
+          pages[key] ||= page
+        end
+
+        { :ids => ids.keys, :pages => pages }
+      end
+
+      def mirrored?(page)
+        Jekyll::Authors.registry.key?(relative_path(page))
+      end
+
+      # Path of the page without its extension: guides/advanced.md -> guides/advanced.
+      def category_key(page)
+        relative_path(page).sub(%r!\.[^./]+\z!, "")
+      end
+
+      # <li> items for a category: sub categories first, then members.
+      def entries(page, site, category = nil)
+        id = category || category_for(page, site, nil)
+        return [] if id.nil?
+
+        items = child_categories(site, id).map do |_child, child_page|
+          link_item(site, child_page, "category-list-child")
+        end
+        items.concat(members(site, id, page).map { |doc| link_item(site, doc) })
+        items
+      end
+
+      def link_item(site, doc, css_class = nil)
+        klass = css_class.nil? ? "" : %( class="#{css_class}")
+        %(<li#{klass}><a href="#{CGI.escapeHTML(doc_url(site, doc))}">) +
+          "#{CGI.escapeHTML(display_name(doc))}</a></li>"
+      end
+
+      # Category of the current page: explicit argument -> the category this
+      # page hosts -> the primary declared category -> inferred from the path.
       def category_for(page, site, explicit = nil)
         value = explicit.to_s.strip
-        return value unless value.empty?
+        unless value.empty?
+          id = Jekyll::PluginUtils.category_normalize(value)
+          return id if !id.nil? && Jekyll::PluginUtils.category_valid?(id)
+
+          return nil
+        end
         return nil if page.nil?
 
-        data = page.respond_to?(:data) ? page.data : page
-        categories = Jekyll::PluginUtils.normalize_list(data["categories"])
-        return categories.first unless categories.empty?
+        return category_key(page) if category_page?(page, site)
 
-        single = Jekyll::PluginUtils.normalize_list(data["category"]).first
-        return single unless single.nil?
+        data = page.respond_to?(:data) ? page.data : page
+        raw = data["categories"]
+        raw = data["category"] if raw.nil?
+        primary, = Jekyll::PluginUtils.primary_category(raw)
+        return primary unless primary.nil?
 
         rel = relative_path(page)
         if rel.include?("/")
-          rel.split("/").first
+          Jekyll::PluginUtils.category_normalize(rel.split("/").first)
         else
           base = File.basename(rel, File.extname(rel))
           base.empty? ? nil : base
         end
       end
 
-      # Pages under <category>/ first (by path), then posts in that category
-      # (newest first). The current page and duplicate URLs are skipped.
+      # Direct pages under <category>/ first (by chapter order, then path), then
+      # posts in that category (newest first). The current page, category pages
+      # and duplicate URLs are skipped.
       def members(site, category, current = nil)
         prefix = "#{category}/"
         current_path = current.nil? ? nil : relative_path(current)
 
         pages = site.pages.select do |doc|
           rel = relative_path(doc)
-          rel.start_with?(prefix) && rel != current_path
+          next false if rel == current_path
+          next false unless rel.start_with?(prefix)
+
+          rest = rel[prefix.length..]
+          next false if rest.nil? || rest.include?("/")
+
+          !category_page?(doc, site)
         end
         pages.sort_by! { |doc| page_sort_key(doc) }
 
         posts = site.posts.docs.select do |doc|
           next false if current_path && relative_path(doc) == current_path
 
-          Jekyll::PluginUtils.normalize_list(doc.data["categories"]).include?(category)
+          Jekyll::PluginUtils.normalize_list(doc.data["categories"]).any? do |raw|
+            Jekyll::PluginUtils.category_normalize(raw) == category
+          end
         end
         posts.sort_by! { |doc| post_date(doc) || Time.at(0) }
         posts.reverse!
@@ -139,11 +310,12 @@ module Jekyll
       end
 
       def doc_url(site, doc)
-        url = doc.respond_to?(:url) ? doc.url : doc["url"]
-        url = url.to_s
+        # `url` is already percent encoded by Jekyll; escaping it again would turn
+        # %E5 into %25E5. link_item only needs HTML escaping.
+        url = (doc.respond_to?(:url) ? doc.url : doc["url"]).to_s
         base = site.respond_to?(:baseurl) ? site.baseurl.to_s : ""
         url = "#{base}#{url}" unless base.empty? || url.start_with?(base)
-        Jekyll::URL.escape_path(url)
+        url
       end
     end
 
@@ -165,6 +337,11 @@ module Jekyll
 end
 
 Liquid::Template.register_tag("category_list", Jekyll::CategoryList::Tag)
+
+Jekyll::Hooks.register :site, :after_reset do |site|
+  Jekyll::CategoryList.reset_index
+  Jekyll::CategoryList.allow_listing_pages(site)
+end
 
 Jekyll::Hooks.register :pages, :pre_render do |page, _payload|
   Jekyll::CategoryList.inject(page)

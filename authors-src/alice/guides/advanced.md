@@ -15,6 +15,14 @@ tags: [guide]
   somewhere else instead.
 - `_plugins/PluginUtils.rb` normalises `categories` and `tags`, so both
   `categories: [a, b]` and the space separated `categories: a b` work.
+- Categories nest: `categories: [guides/recipes]` mirrors a page to
+  `guides/recipes/<title>.md`, however deep the tree goes.
+- A page whose title matches a sub category's folder becomes that sub category's
+  page without any switch — `recipes.md` in this demo hosts `guides/recipes`
+  through nothing but its `title`, `categories` and the fact that somebody
+  declares `guides/recipes`.
+- Every page gets exactly one "back up" link — its chapter root, its sub category
+  page, its category page, or the home page, depending on where it sits.
 
 ## Where to look next
 
